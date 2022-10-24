@@ -12,6 +12,7 @@ class RCLdataset(Dataset):
             self.contrastive_labels = contrastive_labels
         else:
             self.contrastive_labels = None
+        self.rel_descs = None
         
     def __getitem__(self, idx):
         contrastive_features = self.contrastive_features
@@ -25,6 +26,9 @@ class RCLdataset(Dataset):
                 "entity_idx": contrastive_entity_idx[idx],
                 "label": contrastive_labels[idx]
             }
+            if self.rel_descs:
+                output["rel_descs"] = self.rel_descs[idx]
+                
             if "token_type_ids" in contrastive_features[idx].keys():
                 output["token_type_ids"] = contrastive_features[idx]["token_type_ids"]
         else:
@@ -71,6 +75,10 @@ def collate_fn(batch):
             'entity_idx': batch_entity_idx,
             'label': batch_labels
            }
+        if 'rel_descs' in batch[0].keys():
+            batch_rel_descs = [data["rel_descs"] for data in batch]
+            output['rel_descs'] = batch_rel_descs
+
         if batch_token_type_ids is not None:
             output['token_type_ids'] = batch_token_type_ids
     else:

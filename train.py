@@ -10,6 +10,7 @@ import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import pandas as pd
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from transformers import AdamW, get_linear_schedule_with_warmup
 from transformers import AutoTokenizer, AutoModel, AutoConfig
@@ -71,6 +72,11 @@ def train(contrastive_dataset, model, device, train_batch_size, train_epochs, se
             else:
                 classify_labels = None
 
+            if 'rel_descs' in data.keys():
+                rel_descs = data['rel_descs'].to(device)
+            else:
+                rel_descs = None
+
             
             loss = model(
                         input_ids, 
@@ -78,7 +84,8 @@ def train(contrastive_dataset, model, device, train_batch_size, train_epochs, se
                         token_type_ids=token_type_ids, 
                         classify_labels=classify_labels, 
                         entity_idx=entity_idx,
-                        use_cls=False
+                        use_cls=False, 
+                        rel_descs=rel_descs
                     ) # mark
             
 #             loss = model(
@@ -111,12 +118,13 @@ if __name__=='__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--gpu", type=str, default='0')
     parser.add_argument("--max_length", type=int, default=96)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=12)
     parser.add_argument("--epochs", type=int, default=4)
     parser.add_argument("--temp", type=float, default=0.05)
     parser.add_argument("--alpha", type=float, default=0.4)
     parser.add_argument("--dropout", type=float, default=0.5)
     parser.add_argument("--seeds", type=int, default=41)
+    parser.add_argument("--rel_desc", type=bool, default=False)
     parser.add_argument("--data_path", type=str, default='data/semeval_data.csv')
     
     # setting
@@ -158,15 +166,23 @@ if __name__=='__main__':
     special_tokens_dict = {'additional_special_tokens': ['<e1>', '</e1>', '<e2>', '</e2>']}  # add special token
     tokenizer.add_special_tokens(special_tokens_dict)
 
+
     #data
     seen_sentences, seen_labels, seen_label_ids, label2id = read_data(data_path, train_labellist, use_mark=True)
+    id2label = {v:k for k,v in label2id.items()}
     unseen_sentences, unseen_labels, unseen_label_ids, unseen_dict = read_data(data_path, test_labellist, use_mark=True)
     contrastive_sentence_pairs, contrastive_labels = get_contrastive_data(seen_sentences, seen_label_ids)
     #feature
     contrastive_features = get_contrastive_feature(contrastive_sentence_pairs, tokenizer, max_length)
     contrastive_entity_idx = get_entity_idx(contrastive_features, tokenizer)
     contrastive_dataset = RCLdataset(contrastive_features, contrastive_entity_idx, contrastive_labels)
-    model = RCL(pretrained_model, temp, device, len(label2id), dropout=dropout, special_tokenizer=tokenizer)
+    
+    if args.rel_desc:
+        rel_data = pd.read_csv('data/wikidata_properties.csv')
+        label2rel_desc = {row['label']:row['description'] for _, row in rel_data.iterrows() if row['label'] in labellist}
+        contrastive_dataset.rel_descs = [label2rel_desc[label] for label in seen_labels]
+
+    model = RCL(pretrained_model, temp, device, len(label2id), dropout=dropout, special_tokenizer=tokenizer, rel_desc=args.rel_desc)
     
     # train
     train(contrastive_dataset, model, device, train_batch_size=batch_size, train_epochs=epochs, seeds=seeds, save_model=save_model, collate_fn=collate_fn)
@@ -197,60 +213,82 @@ if __name__=='__main__':
             e2_idx = (sent_feature['input_ids'][0] == e2_tks_id).nonzero().flatten().tolist()[0] 
             entity_idx = (e1_idx, e2_idx)
 
-            sent_emb = model.encode(input_ids, attention_mask, token_type_ids=token_type_ids, entity_idx=entity_idx, use_cls=False)  # mark
+            sent_emb = model.encode(input_ids, attention_mask, token_type_ids=token_type_ids, entity_idx=entity_idx, use_cls=False, use_desc = args.rel_desc)  # mark
     #         sent_emb = model.encode(input_ids, attention_mask, token_type_ids=token_type_ids, entity_idx=entity_idx, use_cls=True)  # cls
             sent_emb = sent_emb.detach().cpu().numpy()
             sent_embs.append(sent_emb[0])
 
-    validation_time = format_time(time.time() - t0)
-    print("  Validation took: {:}".format(validation_time))
+    if not args.rel_desc:
+        validation_time = format_time(time.time() - t0)
+        print("  Validation took: {:}".format(validation_time))
 
-    t0 = time.time()
-    sent_embs = torch.tensor(sent_embs)
-    print("data dimension is {}. ".format(sent_embs.shape[-1]))
-    clusters = KMeans(n_clusters=unseen_nums, n_init=20)  #kmeans
-    predict_labels = clusters.fit_predict(sent_embs)
-    
-    
-    # evaluation
-    metric_result = standard_metric_result(unseen_labels, predict_labels, labellist)
-    # B3
-    print('pretrained class eval')
-    cluster_eval = ClusterEvaluation(unseen_label_ids, predict_labels).printEvaluation()
-    print('B3', cluster_eval)
-    # NMI, ARI, V_measure
-    nmi = normalized_mutual_info_score
-    print('NMI', nmi(unseen_label_ids, predict_labels))
-    print('ARI', adjusted_rand_score(unseen_label_ids, predict_labels))
-    print('Homogeneity', homogeneity_score(unseen_label_ids, predict_labels))
-    print('Completeness', completeness_score(unseen_label_ids, predict_labels))
-    print('V_measure', v_measure_score(unseen_label_ids, predict_labels))
+        t0 = time.time()
+        sent_embs = torch.tensor(sent_embs)
+        print("data dimension is {}. ".format(sent_embs.shape[-1]))
+        clusters = KMeans(n_clusters=unseen_nums, n_init=20)  #kmeans
+        predict_labels = clusters.fit_predict(sent_embs)
+        
+        
+        # evaluation
+        metric_result = standard_metric_result(unseen_labels, predict_labels, labellist)
+        # B3
+        print('pretrained class eval')
+        cluster_eval = ClusterEvaluation(unseen_label_ids, predict_labels).printEvaluation()
+        print('B3', cluster_eval)
+        # NMI, ARI, V_measure
+        nmi = normalized_mutual_info_score
+        print('NMI', nmi(unseen_label_ids, predict_labels))
+        print('ARI', adjusted_rand_score(unseen_label_ids, predict_labels))
+        print('Homogeneity', homogeneity_score(unseen_label_ids, predict_labels))
+        print('Completeness', completeness_score(unseen_label_ids, predict_labels))
+        print('V_measure', v_measure_score(unseen_label_ids, predict_labels))
 
-    B3_F1 = cluster_eval['F1']
-    B3_precision = cluster_eval['precision']
-    B3_recall = cluster_eval['recall']
-    NMI = normalized_mutual_info_score(unseen_label_ids, predict_labels)
-    ARI = adjusted_rand_score(unseen_label_ids, predict_labels)
-    Homogeneity = homogeneity_score(unseen_label_ids, predict_labels)
-    Completeness = completeness_score(unseen_label_ids, predict_labels)
-    V_measure = v_measure_score(unseen_label_ids, predict_labels)
+        B3_F1 = cluster_eval['F1']
+        B3_precision = cluster_eval['precision']
+        B3_recall = cluster_eval['recall']
+        NMI = normalized_mutual_info_score(unseen_label_ids, predict_labels)
+        ARI = adjusted_rand_score(unseen_label_ids, predict_labels)
+        Homogeneity = homogeneity_score(unseen_label_ids, predict_labels)
+        Completeness = completeness_score(unseen_label_ids, predict_labels)
+        V_measure = v_measure_score(unseen_label_ids, predict_labels)
 
-    evaluation_dict = {
-        'test_labellist': test_labellist, 
-        'B3_F1': B3_F1,
-        'B3_precision': B3_precision,
-        'B3_recall': B3_recall,
-        'NMI': NMI,
-        'ARI': ARI, 
-        'Homogeneity': Homogeneity,
-        'Completeness': Completeness,
-        'V_measure': V_measure
-    }
-    evaluation_dict = json.dumps(evaluation_dict, indent=4)
-    with open(save_eval_result, 'w') as f:
-        f.write('seen nums: {0}, unseen nums: {1}'.format(seen_nums, unseen_nums))
-        f.write('\n')
-        f.write(metric_result)
-        f.write('\n')
-        f.write('\n')
-        f.write(evaluation_dict)
+        evaluation_dict = {
+            'test_labellist': test_labellist, 
+            'B3_F1': B3_F1,
+            'B3_precision': B3_precision,
+            'B3_recall': B3_recall,
+            'NMI': NMI,
+            'ARI': ARI, 
+            'Homogeneity': Homogeneity,
+            'Completeness': Completeness,
+            'V_measure': V_measure
+        }
+        evaluation_dict = json.dumps(evaluation_dict, indent=4)
+        with open(save_eval_result, 'w') as f:
+            f.write('seen nums: {0}, unseen nums: {1}'.format(seen_nums, unseen_nums))
+            f.write('\n')
+            f.write(metric_result)
+            f.write('\n')
+            f.write('\n')
+            f.write(evaluation_dict)
+    elif args.rel_desc:
+        #create label 2 emb
+        label2emb = {}
+        predicts = []
+        for label in labellist:
+            desc = label2rel_desc[label]
+            desc_feature = tokenizer(desc, padding=True, truncation=True, return_tensors='pt')
+            with torch.no_grad():
+                sent_model_output = model.sent_model(**desc_feature)
+                rel_desc_embeddings = model.dropout(utils.mean_pooling(sent_model_output, desc_feature['attention_mask']))
+                label2emb[label] = rel_desc_embeddings.detach().cpu().numpy()
+        for sent_emb in sent_embs:
+            sent_emb = sent_emb.reshape(1, -1)
+            dists = []
+            for label in labellist:
+                dist = cosine(sent_emb, label2emb[label])
+                dists.append(dist)
+            predict = labellist[np.argmin(dists)]
+            predicts.append(predict)
+        metric_result = standard_metric_result(unseen_labels, predicts, labellist)
+        print(metric_result)
